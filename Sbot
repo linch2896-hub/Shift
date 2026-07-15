@@ -1,0 +1,945 @@
+import os
+import json
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+
+# ================= НАСТРОЙКИ =================
+TOKEN = os.environ.get('TOKEN', '8982534262:AAGRHPxIN50Q5PSbTkfrymYG9PjktECzgB8')
+ADMIN_ID = 914930076  # <-- ВСТАВЬТЕ СЮДА ВАШ ID ИЗ @userinfobot
+DATA_FILE = "shift_data.json"
+
+# ================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =================
+operators_db = {}
+schedule_db = {}
+skip_db = {}
+swap_requests = {}
+attendance_db = {}  # {"2026-07-15": {"user_id": 123, "checkin": "09:05", "checkout": "20:10"}}
+
+# ================= РАБОТА С ФАЙЛАМИ =================
+def load_data():
+    global operators_db, schedule_db, skip_db, swap_requests, attendance_db
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            operators_db = data.get('operators', {})
+            schedule_db = data.get('schedule', {})
+            skip_db = data.get('skips', {})
+            swap_requests = data.get('swaps', {})
+            attendance_db = data.get('attendance', {})
+    else:
+        operators_db, schedule_db, skip_db, swap_requests, attendance_db = {}, {}, {}, {}, {}
+
+def save_data():
+    data = {
+        'operators': operators_db,
+        'schedule': schedule_db,
+        'skips': skip_db,
+        'swaps': swap_requests,
+        'attendance': attendance_db
+    }
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+def get_ru_day(date_obj):
+    ru_days = {"Monday": "Пн", "Tuesday": "Вт", "Wednesday": "Ср", "Thursday": "Чт",
+               "Friday": "Пт", "Saturday": "Сб", "Sunday": "Вс"}
+    return ru_days.get(date_obj.strftime('%A'), date_obj.strftime('%A'))
+
+def parse_date(date_str):
+    """Парсит ДД.ММ в формат YYYY-MM-DD"""
+    try:
+        day, month = date_str.split('.')
+        return datetime(2026, int(month), int(day)).strftime('%Y-%m-%d')
+    except:
+        return None
+
+def find_replacement(exclude_user_id, date_str):
+    active_operators = [uid for uid in operators_db.keys() if uid != exclude_user_id]
+    if not active_operators:
+        return None
+    
+    today = datetime.strptime(date_str, '%Y-%m-%d').date()
+    yesterday = (today - timedelta(days=1)).strftime('%Y-%m-%d')
+    day_before = (today - timedelta(days=2)).strftime('%Y-%m-%d')
+    
+    worked_recently = set()
+    if yesterday in schedule_db:
+        for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
+    if day_before in schedule_db:
+        for s in schedule_db[day_before]: worked_recently.add(s['user_id'])
+    if date_str in skip_db:
+        worked_recently.add(skip_db[date_str]['user_id'])
+    
+    available = [uid for uid in active_operators if uid not in worked_recently]
+    if not available:
+        available = active_operators[:]
+    
+    available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
+    return available[0] if available else None
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+# ================= КОМАНДЫ: ОБЩИЕ =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = update.effective_user.first_name
+    role = "Администратор" if is_admin(user_id) else "Оператор"
+    
+    text = (f" Привет, {name}! Я бот для управления сменами.\n"
+            f"Твоя роль: {role}\n\n"
+            f"Напиши /help чтобы увидеть все команды.")
+    await update.message.reply_text(text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    admin = is_admin(user_id)
+    
+    text = "📋 **Команды для всех:**\n"
+    text += "/register — зарегистрироваться\n"
+    text += "/my_shifts — мои смены на 2 недели\n"
+    text += "/next — моя следующая смена\n"
+    text += "/schedule — общий график на неделю\n"
+    text += "/skip ДД.ММ причина — пропустить смену\n"
+    text += "/swap ДД.ММ @username — поменяться сменой\n"
+    text += "/checkin — отметиться на смене\n"
+    text += "/checkout — отметиться об уходе\n\n"
+    
+    if admin:
+        text += "👑 **Команды Админа:**\n"
+        text += "/operators — список операторов\n"
+        text += "/add_operator @username Имя — добавить оператора\n"
+        text += "/remove_operator @username — удалить оператора\n"
+        text += "/assign @username ДД.ММ — назначить на смену\n"
+        text += "/remove @username ДД.ММ — убрать со смены\n"
+        text += "/operator_stats — статистика по операторам\n"
+        text += "/monthly_stats — статистика за месяц\n"
+        text += "/generate_week — график на 7 дней\n"
+        text += "/generate_month — график на 30 дней\n"
+        text += "/clear_schedule — очистить график\n"
+        text += "/attendance ДД.ММ — кто вышел на смену\n"
+    
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+# ================= РЕГИСТРАЦИЯ =================
+async def register_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    name = update.effective_user.first_name
+    username = update.effective_user.username or "без_username"
+    
+    if user_id in operators_db:
+        await update.message.reply_text(f"Вы уже зарегистрированы как {operators_db[user_id]['name']}! ✅")
+        return
+    
+    operators_db[user_id] = {
+        "name": name,
+        "username": f"@{username}",
+        "shifts_count": 0,
+        "chat_id": chat_id
+    }
+    save_data()
+    await update.message.reply_text(f"✅ {name}, вы успешно зарегистрированы!")
+
+async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ добавляет оператора вручную"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /add_operator @username Имя")
+        return
+    
+    username = context.args[0].lstrip('@')
+    name = " ".join(context.args[1:])
+    
+    # Ищем пользователя по username (упрощенно - по тексту)
+    user_id = hash(username) % 1000000000  # Временный ID, в реальности нужен поиск
+    
+    operators_db[user_id] = {
+        "name": name,
+        "username": f"@{username}",
+        "shifts_count": 0,
+        "chat_id": None  # Админ добавляет, chat_id неизвестен
+    }
+    save_data()
+    await update.message.reply_text(f"✅ Оператор {name} (@{username}) добавлен в систему!")
+
+async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ удаляет оператора"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Использование: /remove_operator @username")
+        return
+    
+    username = context.args[0].lstrip('@')
+    
+    for uid, data in list(operators_db.items()):
+        if data['username'].lstrip('@') == username:
+            name = data['name']
+            del operators_db[uid]
+            save_data()
+            await update.message.reply_text(f"️ Оператор {name} удалён из системы.")
+            return
+    
+    await update.message.reply_text(f"Оператор @{username} не найден.")
+
+# ================= ПРОСМОТР ГРАФИКА =================
+async def my_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    name = operators_db[user_id]['name']
+    today = datetime.now().date()
+    my_shifts_list = []
+    
+    for i in range(14):
+        day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
+        if day in schedule_db:
+            for shift in schedule_db[day]:
+                if shift['user_id'] == user_id:
+                    my_shifts_list.append((day, shift))
+    
+    if not my_shifts_list:
+        await update.message.reply_text(f"{name}, на ближайшие 2 недели у вас нет назначенных смен. 🌴")
+        return
+    
+    msg = f"📅 Ваши смены, {name} (09:00 - 20:00):\n\n"
+    for day, shift in my_shifts_list:
+        date_obj = datetime.strptime(day, '%Y-%m-%d')
+        day_ru = get_ru_day(date_obj)
+        skip_mark = " ⚠️ ПРОПУСК" if day in skip_db and skip_db[day].get('user_id') == user_id else ""
+        msg += f"📅 {date_obj.strftime('%d.%m')} ({day_ru}){skip_mark}\n"
+    
+    await update.message.reply_text(msg)
+
+async def next_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать следующую смену"""
+    user_id = update.effective_user.id
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    name = operators_db[user_id]['name']
+    today = datetime.now().date()
+    
+    for i in range(30):
+        day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
+        if day in schedule_db:
+            for shift in schedule_db[day]:
+                if shift['user_id'] == user_id:
+                    if day in skip_db and skip_db[day].get('user_id') == user_id:
+                        continue
+                    date_obj = datetime.strptime(day, '%Y-%m-%d')
+                    day_ru = get_ru_day(date_obj)
+                    days_left = i
+                    if days_left == 0:
+                        when = "сегодня"
+                    elif days_left == 1:
+                        when = "завтра"
+                    else:
+                        when = f"через {days_left} дня"
+                    
+                    msg = f"📅 {name}, твоя следующая смена: **{date_obj.strftime('%d.%m')} ({day_ru})** — {when}\n⏰ 09:00 - 20:00"
+                    await update.message.reply_text(msg, parse_mode='Markdown')
+                    return
+    
+    await update.message.reply_text(f"{name}, у вас нет предстоящих смен. 🌴")
+
+async def schedule_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().date()
+    msg = "📋 **График смен на неделю (09:00 - 20:00):**\n\n"
+    
+    has_shifts = False
+    for i in range(7):
+        day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
+        day_obj = today + timedelta(days=i)
+        
+        if day in schedule_db and schedule_db[day]:
+            has_shifts = True
+            day_ru = get_ru_day(day_obj)
+            skip_info = ""
+            if day in skip_db:
+                skip_name = operators_db.get(skip_db[day]['user_id'], {}).get('name', 'Неизвестно')
+                skip_info = f" ⚠️ {skip_name} не выйдет ({skip_db[day]['reason']})"
+            
+            msg += f"📅 **{day_obj.strftime('%d.%m')} ({day_ru})**{skip_info}\n"
+            for shift in schedule_db[day]:
+                if day in skip_db and skip_db[day].get('user_id') == shift['user_id']:
+                    msg += f"  ❌ ~~{shift['name']}~~ (пропуск)\n"
+                else:
+                    msg += f"  👤 {shift['name']}\n"
+            
+            if day in skip_db and 'replacement' in skip_db[day]:
+                repl_name = operators_db.get(skip_db[day]['replacement'], {}).get('name', 'Неизвестно')
+                msg += f"  🔄 Замена: {repl_name}\n"
+            msg += "\n"
+    
+    if not has_shifts:
+        msg = " На ближайшую неделю график ещё не составлен."
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+# ================= УПРАВЛЕНИЕ ОПЕРАТОРАМИ (АДМИН) =================
+async def list_operators(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if not operators_db:
+        await update.message.reply_text("Пока никто не зарегистрирован.")
+        return
+    
+    msg = "👥 Список операторов:\n\n"
+    for uid, data in operators_db.items():
+        msg += f"• {data['name']} ({data['username']}) — смен: {data['shifts_count']}\n"
+    
+    await update.message.reply_text(msg)
+
+async def operator_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if not operators_db:
+        await update.message.reply_text("Пока нет данных.")
+        return
+    
+    skip_counts = {}
+    for day, data in skip_db.items():
+        uid = data.get('user_id')
+        if uid:
+            skip_counts[uid] = skip_counts.get(uid, 0) + 1
+    
+    sorted_operators = sorted(operators_db.items(), key=lambda x: x[1]['shifts_count'], reverse=True)
+    
+    msg = "📊 **Статистика операторов:**\n\n"
+    for uid, data in sorted_operators:
+        skips = skip_counts.get(uid, 0)
+        reliability = "✅" if skips == 0 else ("⚠️" if skips <= 2 else "❌")
+        msg += f"{reliability} **{data['name']}** — {data['shifts_count']} смен, {skips} пропусков\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def monthly_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    today = datetime.now().date()
+    month_start = today.replace(day=1)
+    month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    
+    msg = f"📊 **Статистика за {month_start.strftime('%B %Y')}**:\n\n"
+    
+    operator_monthly = {uid: 0 for uid in operators_db}
+    for day_str, shifts in schedule_db.items():
+        day = datetime.strptime(day_str, '%Y-%m-%d').date()
+        if month_start <= day <= month_end:
+            for shift in shifts:
+                uid = shift['user_id']
+                if uid in operator_monthly:
+                    operator_monthly[uid] += 1
+    
+    sorted_ops = sorted(operator_monthly.items(), key=lambda x: x[1], reverse=True)
+    for uid, count in sorted_ops:
+        name = operators_db[uid]['name']
+        msg += f"• {name}: {count} смен\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+# ================= ГЕНЕРАЦИЯ ГРАФИКА =================
+async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    active_operators = list(operators_db.keys())
+    if len(active_operators) < 2:
+        await update.message.reply_text("Нужно минимум 2 оператора!")
+        return
+    
+    today = datetime.now().date()
+    msg = "️ **График смен на неделю (09:00 - 20:00):**\n\n"
+    notifications = []
+    
+    for i in range(7):
+        day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
+        day_obj = today + timedelta(days=i)
+        yesterday = (today + timedelta(days=i-1)).strftime('%Y-%m-%d')
+        day_before = (today + timedelta(days=i-2)).strftime('%Y-%m-%d')
+        
+        worked_recently = set()
+        if yesterday in schedule_db:
+            for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
+        if day_before in schedule_db:
+            for s in schedule_db[day_before]: worked_recently.add(s['user_id'])
+        if day in skip_db:
+            worked_recently.add(skip_db[day]['user_id'])
+        
+        available = [uid for uid in active_operators if uid not in worked_recently]
+        if len(available) < 2:
+            available = active_operators[:]
+        
+        available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
+        chosen_ids = available[:2]
+        schedule_db[day] = []
+        
+        day_ru = get_ru_day(day_obj)
+        msg += f"📅 **{day_obj.strftime('%d.%m')} ({day_ru})**\n"
+        for uid in chosen_ids:
+            operators_db[uid]['shifts_count'] += 1
+            schedule_db[day].append({"user_id": uid, "name": operators_db[uid]['name']})
+            msg += f"  👤 {operators_db[uid]['name']}\n"
+            
+            # Собираем уведомления
+            if uid not in [n['uid'] for n in notifications]:
+                notifications.append({'uid': uid, 'days': []})
+            for n in notifications:
+                if n['uid'] == uid:
+                    n['days'].append(f"{day_obj.strftime('%d.%m')} ({day_ru})")
+        msg += "\n"
+        
+        # Проверка нехватки
+        if len(chosen_ids) < 2:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!"
+                )
+            except:
+                pass
+    
+    save_data()
+    await update.message.reply_text(msg, parse_mode='Markdown')
+    
+    # Рассылаем уведомления операторам
+    for notif in notifications:
+        uid = notif['uid']
+        if uid in operators_db and operators_db[uid].get('chat_id'):
+            try:
+                days_str = ", ".join(notif['days'])
+                await context.bot.send_message(
+                    chat_id=operators_db[uid]['chat_id'],
+                    text=f"📅 {operators_db[uid]['name']}, ваш график на неделю:\n{days_str}\n⏰ 09:00 - 20:00"
+                )
+            except:
+                pass
+
+async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    active_operators = list(operators_db.keys())
+    if len(active_operators) < 2:
+        await update.message.reply_text("Нужно минимум 2 оператора!")
+        return
+    
+    today = datetime.now().date()
+    msg = "🗓️ **График смен на месяц (09:00 - 20:00):**\n\n"
+    
+    for i in range(30):
+        day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
+        day_obj = today + timedelta(days=i)
+        yesterday = (today + timedelta(days=i-1)).strftime('%Y-%m-%d')
+        day_before = (today + timedelta(days=i-2)).strftime('%Y-%m-%d')
+        
+        worked_recently = set()
+        if yesterday in schedule_db:
+            for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
+        if day_before in schedule_db:
+            for s in schedule_db[day_before]: worked_recently.add(s['user_id'])
+        
+        available = [uid for uid in active_operators if uid not in worked_recently]
+        if len(available) < 2:
+            available = active_operators[:]
+        
+        available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
+        chosen_ids = available[:2]
+        schedule_db[day] = []
+        
+        day_ru = get_ru_day(day_obj)
+        msg += f"📅 **{day_obj.strftime('%d.%m')} ({day_ru})**\n"
+        for uid in chosen_ids:
+            operators_db[uid]['shifts_count'] += 1
+            schedule_db[day].append({"user_id": uid, "name": operators_db[uid]['name']})
+            msg += f"  👤 {operators_db[uid]['name']}\n"
+        msg += "\n"
+    
+    save_data()
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+# ================= РУЧНОЕ УПРАВЛЕНИЕ СМЕНАМИ =================
+async def assign_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ назначает оператора на смену"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /assign @username ДД.ММ")
+        return
+    
+    username = context.args[0].lstrip('@')
+    date_str = context.args[1]
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        await update.message.reply_text("Неверный формат даты. Используйте ДД.ММ")
+        return
+    
+    # Ищем оператора
+    target_uid = None
+    target_name = None
+    for uid, data in operators_db.items():
+        if data['username'].lstrip('@') == username:
+            target_uid = uid
+            target_name = data['name']
+            break
+    
+    if not target_uid:
+        await update.message.reply_text(f"Оператор @{username} не найден.")
+        return
+    
+    if date_formatted not in schedule_db:
+        schedule_db[date_formatted] = []
+    
+    # Проверяем, нет ли уже
+    if any(s['user_id'] == target_uid for s in schedule_db[date_formatted]):
+        await update.message.reply_text(f"{target_name} уже назначен на {date_str}.")
+        return
+    
+    schedule_db[date_formatted].append({"user_id": target_uid, "name": target_name})
+    operators_db[target_uid]['shifts_count'] += 1
+    save_data()
+    
+    date_obj = datetime.strptime(date_formatted, '%Y-%m-%d')
+    day_ru = get_ru_day(date_obj)
+    await update.message.reply_text(f"✅ {target_name} назначен на {date_obj.strftime('%d.%m')} ({day_ru})")
+
+async def remove_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ убирает оператора со смены"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /remove @username ДД.ММ")
+        return
+    
+    username = context.args[0].lstrip('@')
+    date_str = context.args[1]
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        await update.message.reply_text("Неверный формат даты.")
+        return
+    
+    if date_formatted not in schedule_db:
+        await update.message.reply_text(f"На {date_str} нет графика.")
+        return
+    
+    for i, shift in enumerate(schedule_db[date_formatted]):
+        uid = shift['user_id']
+        if uid in operators_db and operators_db[uid]['username'].lstrip('@') == username:
+            name = operators_db[uid]['name']
+            schedule_db[date_formatted].pop(i)
+            operators_db[uid]['shifts_count'] = max(0, operators_db[uid]['shifts_count'] - 1)
+            save_data()
+            await update.message.reply_text(f"🗑️ {name} убран со смены {date_str}")
+            return
+    
+    await update.message.reply_text(f"Оператор @{username} не найден в графике на {date_str}.")
+
+# ================= ПРОПУСК И ЗАМЕНА =================
+async def skip_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /skip ДД.ММ причина\nПример: /skip 15.07 болезнь")
+        return
+    
+    date_str = context.args[0]
+    reason = " ".join(context.args[1:])
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        await update.message.reply_text("Неверный формат даты.")
+        return
+    
+    if date_formatted not in schedule_db:
+        await update.message.reply_text(f"На {date_str} у вас нет смены.")
+        return
+    
+    user_has_shift = any(s['user_id'] == user_id for s in schedule_db[date_formatted])
+    if not user_has_shift:
+        await update.message.reply_text(f"На {date_str} у вас нет смены.")
+        return
+    
+    replacement_id = find_replacement(user_id, date_formatted)
+    
+    skip_db[date_formatted] = {
+        'user_id': user_id,
+        'reason': reason,
+        'replacement': replacement_id
+    }
+    
+    name = operators_db[user_id]['name']
+    msg = f"⚠️ {name}, ваша смена {date_str} отмечена как пропуск.\nПричина: {reason}\n"
+    
+    if replacement_id:
+        repl_name = operators_db[replacement_id]['name']
+        schedule_db[date_formatted].append({"user_id": replacement_id, "name": repl_name})
+        operators_db[replacement_id]['shifts_count'] += 1
+        msg += f"🔄 Автоматически назначена замена: {repl_name}"
+        
+        repl_chat_id = operators_db[replacement_id].get('chat_id')
+        if repl_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=repl_chat_id,
+                    text=f"🔄 {repl_name}, вам назначена замена! Смена {date_str} (09:00-20:00). Причина: {reason}"
+                )
+            except:
+                pass
+    else:
+        msg += " Не удалось найти замену. Администратор уведомлён."
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"⚠️ {name} пропускает смену {date_str} (причина: {reason}). Замена не найдена!"
+            )
+        except:
+            pass
+    
+    save_data()
+    await update.message.reply_text(msg)
+
+async def swap_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /swap ДД.ММ @username")
+        return
+    
+    date_str = context.args[0]
+    target_username = context.args[1].lstrip('@')
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        await update.message.reply_text("Неверный формат даты.")
+        return
+    
+    target_user = None
+    for uid, data in operators_db.items():
+        if data['username'].lstrip('@') == target_username:
+            target_user = {'id': uid, 'data': data}
+            break
+    
+    if not target_user:
+        await update.message.reply_text(f"Оператор @{target_username} не найден.")
+        return
+    
+    if date_formatted not in schedule_db:
+        await update.message.reply_text(f"На {date_str} нет графика.")
+        return
+    
+    requester_has = any(s['user_id'] == user_id for s in schedule_db[date_formatted])
+    target_has = any(s['user_id'] == target_user['id'] for s in schedule_db[date_formatted])
+    
+    if not requester_has or not target_has:
+        await update.message.reply_text("У одного из вас нет смены на эту дату.")
+        return
+    
+    request_id = f"{user_id}_{target_user['id']}_{date_formatted}"
+    swap_requests[request_id] = {
+        'from': user_id,
+        'to': target_user['id'],
+        'date': date_formatted,
+        'status': 'pending'
+    }
+    save_data()
+    
+    target_chat_id = target_user['data'].get('chat_id')
+    requester_name = operators_db[user_id]['name']
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Согласен", callback_data=f"swap_accept_{request_id}"),
+         InlineKeyboardButton(" Отказ", callback_data=f"swap_decline_{request_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if target_chat_id:
+        try:
+            await context.bot.send_message(
+                chat_id=target_chat_id,
+                text=f"🔄 {requester_name} хочет поменяться с вами сменой {date_str}. Согласны?",
+                reply_markup=reply_markup
+            )
+        except:
+            pass
+    
+    await update.message.reply_text(f"✅ Запрос на замену отправлен {target_user['data']['name']}.")
+
+async def handle_swap_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if not data.startswith('swap_'):
+        return
+    
+    action, request_id = data.split('_', 1)
+    if request_id not in swap_requests:
+        await query.edit_message_text("Запрос не найден.")
+        return
+    
+    swap = swap_requests[request_id]
+    from_user = operators_db.get(swap['from'])
+    to_user = operators_db.get(swap['to'])
+    date_formatted = swap['date']
+    
+    if action == 'accept':
+        if date_formatted in schedule_db:
+            new_schedule = []
+            for s in schedule_db[date_formatted]:
+                if s['user_id'] == swap['from']:
+                    new_schedule.append({"user_id": swap['to'], "name": to_user['name']})
+                elif s['user_id'] == swap['to']:
+                    new_schedule.append({"user_id": swap['from'], "name": from_user['name']})
+                else:
+                    new_schedule.append(s)
+            schedule_db[date_formatted] = new_schedule
+        
+        swap['status'] = 'accepted'
+        save_data()
+        await query.edit_message_text(f"✅ {to_user['name']} согласился! Смены поменяны.")
+        
+        from_chat_id = from_user.get('chat_id')
+        if from_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=from_chat_id,
+                    text=f"✅ {to_user['name']} согласился поменяться сменой {date_formatted}!"
+                )
+            except:
+                pass
+    
+    elif action == 'decline':
+        swap['status'] = 'declined'
+        save_data()
+        await query.edit_message_text(f"❌ {to_user['name']} отказался.")
+        
+        from_chat_id = from_user.get('chat_id')
+        if from_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=from_chat_id,
+                    text=f"❌ {to_user['name']} отказался меняться сменой {date_formatted}."
+                )
+            except:
+                pass
+
+# ================= ОТМЕТКИ ПОСЕЩАЕМОСТИ =================
+async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now().strftime('%H:%M')
+    
+    if today not in schedule_db or not any(s['user_id'] == user_id for s in schedule_db[today]):
+        await update.message.reply_text("У вас нет смены сегодня!")
+        return
+    
+    if today not in attendance_db:
+        attendance_db[today] = {}
+    
+    attendance_db[today][user_id] = {'checkin': now, 'checkout': None}
+    save_data()
+    
+    name = operators_db[user_id]['name']
+    await update.message.reply_text(f"✅ {name}, вы отметились на смене в {now}")
+
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now().strftime('%H:%M')
+    
+    if today not in attendance_db or user_id not in attendance_db[today]:
+        await update.message.reply_text("Вы не отмечались сегодня на смене!")
+        return
+    
+    attendance_db[today][user_id]['checkout'] = now
+    save_data()
+    
+    name = operators_db[user_id]['name']
+    await update.message.reply_text(f"✅ {name}, вы отметились об уходе в {now}. Хорошего отдыха! 🌙")
+
+async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Использование: /attendance ДД.ММ")
+        return
+    
+    date_str = context.args[0]
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        await update.message.reply_text("Неверный формат даты.")
+        return
+    
+    if date_formatted not in attendance_db:
+        await update.message.reply_text(f"На {date_str} нет данных о посещаемости.")
+        return
+    
+    date_obj = datetime.strptime(date_formatted, '%Y-%m-%d')
+    day_ru = get_ru_day(date_obj)
+    msg = f"📋 **Посещаемость {date_obj.strftime('%d.%m')} ({day_ru}):**\n\n"
+    
+    for uid, record in attendance_db[date_formatted].items():
+        if uid in operators_db:
+            name = operators_db[uid]['name']
+            checkin = record.get('checkin', '—')
+            checkout = record.get('checkout', '—')
+            msg += f"👤 {name}: вход {checkin}, выход {checkout}\n"
+    
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def clear_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ")
+        return
+    
+    schedule_db.clear()
+    skip_db.clear()
+    attendance_db.clear()
+    for uid in operators_db:
+        operators_db[uid]['shifts_count'] = 0
+    save_data()
+    await update.message.reply_text("️ График очищен!")
+
+# ================= УВЕДОМЛЕНИЯ =================
+async def send_morning_notifications(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().strftime('%Y-%m-%d')
+    current_time = datetime.now()
+    
+    if current_time.hour != 8 or current_time.minute > 2:
+        return
+    
+    if today not in schedule_db:
+        return
+    
+    for shift in schedule_db[today]:
+        user_id = shift['user_id']
+        if user_id not in operators_db:
+            continue
+        if today in skip_db and skip_db[today].get('user_id') == user_id:
+            continue
+        
+        chat_id = operators_db[user_id].get('chat_id')
+        name = operators_db[user_id]['name']
+        
+        if chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"☀️ Доброе утро, {name}! Сегодня твоя смена с 09:00 до 20:00. Не забудь! 💪"
+                )
+            except Exception as e:
+                print(f"Ошибка уведомления {name}: {e}")
+
+async def send_evening_notifications(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().strftime('%Y-%m-%d')
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+    current_time = datetime.now()
+    
+    if current_time.hour != 18 or current_time.minute > 2:
+        return
+    
+    if tomorrow not in schedule_db:
+        return
+    
+    for shift in schedule_db[tomorrow]:
+        user_id = shift['user_id']
+        if user_id not in operators_db:
+            continue
+        if tomorrow in skip_db and skip_db[tomorrow].get('user_id') == user_id:
+            continue
+        
+        chat_id = operators_db[user_id].get('chat_id')
+        name = operators_db[user_id]['name']
+        
+        if chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🌙 {name}, завтра у тебя смена с 09:00 до 20:00. Подготовься и выспись! 😊"
+                )
+            except Exception as e:
+                print(f"Ошибка вечернего уведомления {name}: {e}")
+
+# ================= ЗАПУСК =================
+def main():
+    load_data()
+    app = Application.builder().token(TOKEN).build()
+    
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("register", register_operator))
+    app.add_handler(CommandHandler("add_operator", add_operator))
+    app.add_handler(CommandHandler("remove_operator", remove_operator))
+    app.add_handler(CommandHandler("my_shifts", my_shifts))
+    app.add_handler(CommandHandler("next", next_shift))
+    app.add_handler(CommandHandler("schedule", schedule_week))
+    app.add_handler(CommandHandler("operators", list_operators))
+    app.add_handler(CommandHandler("operator_stats", operator_stats))
+    app.add_handler(CommandHandler("monthly_stats", monthly_stats))
+    app.add_handler(CommandHandler("generate_week", generate_week))
+    app.add_handler(CommandHandler("generate_month", generate_month))
+    app.add_handler(CommandHandler("assign", assign_shift))
+    app.add_handler(CommandHandler("remove", remove_shift))
+    app.add_handler(CommandHandler("skip", skip_shift))
+    app.add_handler(CommandHandler("swap", swap_shift))
+    app.add_handler(CommandHandler("checkin", checkin))
+    app.add_handler(CommandHandler("checkout", checkout))
+    app.add_handler(CommandHandler("attendance", attendance))
+    app.add_handler(CommandHandler("clear_schedule", clear_schedule))
+    
+    # Кнопки
+    app.add_handler(CallbackQueryHandler(handle_swap_callback))
+    
+    # Уведомления
+    app.job_queue.run_repeating(send_morning_notifications, interval=60, first=10)
+    app.job_queue.run_repeating(send_evening_notifications, interval=60, first=10)
+    
+    print("🤖 Shift Bot (полная версия) запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
