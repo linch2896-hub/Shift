@@ -15,10 +15,11 @@ schedule_db = {}
 skip_db = {}
 swap_requests = {}
 attendance_db = {}
+GROUP_CHAT_ID = None  # ID группового чата для отправки графика
 
 # ================= РАБОТА С ФАЙЛАМИ =================
 def load_data():
-    global operators_db, schedule_db, skip_db, swap_requests, attendance_db
+    global operators_db, schedule_db, skip_db, swap_requests, attendance_db, GROUP_CHAT_ID
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -27,8 +28,10 @@ def load_data():
             skip_db = data.get('skips', {})
             swap_requests = data.get('swaps', {})
             attendance_db = data.get('attendance', {})
+            GROUP_CHAT_ID = data.get('group_chat_id', None)
     else:
         operators_db, schedule_db, skip_db, swap_requests, attendance_db = {}, {}, {}, {}, {}
+        GROUP_CHAT_ID = None
 
 def save_data():
     data = {
@@ -36,7 +39,8 @@ def save_data():
         'schedule': schedule_db,
         'skips': skip_db,
         'swaps': swap_requests,
-        'attendance': attendance_db
+        'attendance': attendance_db,
+        'group_chat_id': GROUP_CHAT_ID
     }
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -82,14 +86,13 @@ def is_admin(user_id):
     return user_id == ADMIN_ID
 
 async def safe_send(bot, chat_id, text, parse_mode=None):
-    """Безопасная отправка сообщения с обработкой ошибок"""
     try:
         if parse_mode:
             await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
         else:
             await bot.send_message(chat_id=chat_id, text=text)
     except Exception as e:
-        print(f"Не удалось отправить сообщение в {chat_id}: {e}")
+        print(f"Ошибка отправки в {chat_id}: {e}")
 
 # ================= КОМАНДЫ: ОБЩИЕ =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -97,7 +100,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
     role = "Администратор" if is_admin(user_id) else "Оператор"
     
-    text = (f"👋 Привет, {name}! Я бот для управления сменами.\n"
+    text = (f"👋 Привет, {name}! Я бот Veda для управления сменами.\n"
             f"Твоя роль: {role}\n\n"
             f"Напиши /help чтобы увидеть все команды.")
     await update.message.reply_text(text)
@@ -127,6 +130,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "/monthly_stats — статистика за месяц\n"
         text += "/generate_week — график на 7 дней\n"
         text += "/generate_month — график на 30 дней\n"
+        text += "/set_group — установить чат для графика\n"
         text += "/clear_schedule — очистить график\n"
         text += "/attendance ДД.ММ — кто вышел на смену\n"
     
@@ -154,7 +158,7 @@ async def register_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Только для администратора! ")
+        await update.message.reply_text("Только для администратора! ❌")
         return
     
     if len(context.args) < 2:
@@ -176,6 +180,7 @@ async def add_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Оператор {name} (@{username}) добавлен в систему!")
 
 async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полное удаление оператора из системы и всех графиков"""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Только для администратора! ❌")
         return
@@ -185,16 +190,38 @@ async def remove_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     username = context.args[0].lstrip('@')
+    target_uid = None
+    target_name = None
     
     for uid, data in list(operators_db.items()):
         if data['username'].lstrip('@') == username:
-            name = data['name']
-            del operators_db[uid]
-            save_data()
-            await update.message.reply_text(f"️ Оператор {name} удалён из системы.")
-            return
+            target_uid = uid
+            target_name = data['name']
+            break
     
-    await update.message.reply_text(f"Оператор @{username} не найден.")
+    if not target_uid:
+        await update.message.reply_text(f"Оператор @{username} не найден.")
+        return
+    
+    del operators_db[target_uid]
+    
+    for day in schedule_db:
+        schedule_db[day] = [s for s in schedule_db[day] if s['user_id'] != target_uid]
+        
+    days_to_clean = [day for day, data in skip_db.items() if data.get('user_id') == target_uid]
+    for day in days_to_clean:
+        del skip_db[day]
+        
+    for day in attendance_db:
+        if target_uid in attendance_db[day]:
+            del attendance_db[day][target_uid]
+            
+    keys_to_delete = [k for k, v in swap_requests.items() if v.get('from') == target_uid or v.get('to') == target_uid]
+    for k in keys_to_delete:
+        del swap_requests[k]
+        
+    save_data()
+    await update.message.reply_text(f"🗑️ Оператор {target_name} (@{username}) полностью удален из системы, включая все его смены и историю.")
 
 # ================= ПРОСМОТР ГРАФИКА =================
 async def my_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,15 +242,15 @@ async def my_shifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     my_shifts_list.append((day, shift))
     
     if not my_shifts_list:
-        await update.message.reply_text(f"{name}, на ближайшие 2 недели у вас нет назначенных смен. ")
+        await update.message.reply_text(f"{name}, на ближайшие 2 недели у вас нет назначенных смен. 🌴")
         return
     
     msg = f"📅 Ваши смены, {name} (09:00 - 20:00):\n\n"
     for day, shift in my_shifts_list:
         date_obj = datetime.strptime(day, '%Y-%m-%d')
         day_ru = get_ru_day(date_obj)
-        skip_mark = " ️ ПРОПУСК" if day in skip_db and skip_db[day].get('user_id') == user_id else ""
-        msg += f" {date_obj.strftime('%d.%m')} ({day_ru}){skip_mark}\n"
+        skip_mark = " ⚠️ ПРОПУСК" if day in skip_db and skip_db[day].get('user_id') == user_id else ""
+        msg += f"📅 {date_obj.strftime('%d.%m')} ({day_ru}){skip_mark}\n"
     
     await update.message.reply_text(msg)
 
@@ -326,7 +353,7 @@ async def operator_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     sorted_operators = sorted(operators_db.items(), key=lambda x: x[1]['shifts_count'], reverse=True)
     
-    msg = " <b>Статистика операторов:</b>\n\n"
+    msg = "📊 <b>Статистика операторов:</b>\n\n"
     for uid, data in sorted_operators:
         skips = skip_counts.get(uid, 0)
         reliability = "✅" if skips == 0 else ("⚠️" if skips <= 2 else "❌")
@@ -361,6 +388,19 @@ async def monthly_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(msg, parse_mode='HTML')
 
+# ================= УСТАНОВКА ГРУППОВОГО ЧАТА =================
+async def set_group_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установить chat_id группового чата для отправки графика"""
+    global GROUP_CHAT_ID
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    GROUP_CHAT_ID = update.effective_chat.id
+    save_data()
+    
+    await update.message.reply_text(f"✅ Групповой чат установлен! График будет дублироваться сюда.\nChat ID: {GROUP_CHAT_ID}")
+
 # ================= ГЕНЕРАЦИЯ ГРАФИКА =================
 async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -374,6 +414,7 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today = datetime.now().date()
     msg = "🗓️ <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
+    group_msg = " <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
     notifications = []
     
     for i in range(7):
@@ -399,11 +440,16 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_db[day] = []
         
         day_ru = get_ru_day(day_obj)
-        msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        
         for uid in chosen_ids:
             operators_db[uid]['shifts_count'] += 1
             schedule_db[day].append({"user_id": uid, "name": operators_db[uid]['name']})
-            msg += f"  👤 {operators_db[uid]['name']}\n"
+            name = operators_db[uid]['name']
+            
+            msg += f"  👤 {name}\n"
+            group_msg += f"  👤 {name}\n"
             
             existing = [n for n in notifications if n['uid'] == uid]
             if not existing:
@@ -412,28 +458,36 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if n['uid'] == uid:
                     n['days'].append(f"{day_obj.strftime('%d.%m')} ({day_ru})")
         msg += "\n"
+        group_msg += "\n"
         
         if len(chosen_ids) < 2:
             try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"⚠️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!"
-                )
-            except:
-                pass
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!")
+            except: pass
     
     save_data()
+    
+    # 1. Отправляем подробный график АДМИНИСТРАТОРУ
     await update.message.reply_text(msg, parse_mode='HTML')
     
+    # 2. Отправляем общий график в ГРУППОВОЙ ЧАТ
+    if GROUP_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=group_msg, parse_mode='HTML')
+        except Exception as e:
+            print(f"Не удалось отправить в группу: {e}")
+    
+    # 3. Отправляем личные смены каждому ОПЕРАТОРУ
     for notif in notifications:
         uid = notif['uid']
         if uid in operators_db and operators_db[uid].get('chat_id'):
             days_str = ", ".join(notif['days'])
-            await safe_send(
-                context.bot,
-                operators_db[uid]['chat_id'],
-                f"📅 {operators_db[uid]['name']}, ваш график на неделю:\n{days_str}\n⏰ 09:00 - 20:00"
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=operators_db[uid]['chat_id'],
+                    text=f"📅 {operators_db[uid]['name']}, ваш график на неделю:\n{days_str}\n⏰ 09:00 - 20:00"
+                )
+            except: pass
 
 async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -447,6 +501,7 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today = datetime.now().date()
     msg = "🗓️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
+    group_msg = "🗓️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
     
     for i in range(30):
         day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
@@ -470,14 +525,28 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         day_ru = get_ru_day(day_obj)
         msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        
         for uid in chosen_ids:
             operators_db[uid]['shifts_count'] += 1
             schedule_db[day].append({"user_id": uid, "name": operators_db[uid]['name']})
-            msg += f"  👤 {operators_db[uid]['name']}\n"
+            name = operators_db[uid]['name']
+            msg += f"  👤 {name}\n"
+            group_msg += f"  👤 {name}\n"
         msg += "\n"
+        group_msg += "\n"
     
     save_data()
+    
+    # 1. Администратору
     await update.message.reply_text(msg, parse_mode='HTML')
+    
+    # 2. В групповой чат
+    if GROUP_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=group_msg, parse_mode='HTML')
+        except Exception as e:
+            print(f"Не удалось отправить в группу: {e}")
 
 # ================= РУЧНОЕ УПРАВЛЕНИЕ СМЕНАМИ =================
 async def assign_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,7 +742,7 @@ async def swap_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("✅ Согласен", callback_data=f"swap_accept_{request_id}"),
-         InlineKeyboardButton("❌ Отказ", callback_data=f"swap_decline_{request_id}")]
+         InlineKeyboardButton(" Отказ", callback_data=f"swap_decline_{request_id}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -681,9 +750,8 @@ async def swap_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(
             context.bot,
             target_chat_id,
-            f"🔄 {requester_name} хочет поменяться с вами сменой {date_str}. Согласны?",
+            f" {requester_name} хочет поменяться с вами сменой {date_str}. Согласны?",
         )
-        # Отправляем кнопки отдельно, так как safe_send не поддерживает reply_markup
         try:
             await context.bot.send_message(
                 chat_id=target_chat_id,
@@ -740,7 +808,7 @@ async def handle_swap_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == 'decline':
         swap['status'] = 'declined'
         save_data()
-        await query.edit_message_text(f" {to_user['name']} отказался.")
+        await query.edit_message_text(f"❌ {to_user['name']} отказался.")
         
         from_chat_id = from_user.get('chat_id')
         if from_chat_id:
@@ -891,7 +959,7 @@ async def send_evening_notifications(context: ContextTypes.DEFAULT_TYPE):
             await safe_send(
                 context.bot,
                 chat_id,
-                f"🌙 {name}, завтра у тебя смена с 09:00 до 20:00. Подготовься и выспись! 😊"
+                f" {name}, завтра у тебя смена с 09:00 до 20:00. Подготовься и выспись! 😊"
             )
 
 # ================= ЗАПУСК =================
@@ -912,6 +980,7 @@ def main():
     app.add_handler(CommandHandler("monthly_stats", monthly_stats))
     app.add_handler(CommandHandler("generate_week", generate_week))
     app.add_handler(CommandHandler("generate_month", generate_month))
+    app.add_handler(CommandHandler("set_group", set_group_chat))
     app.add_handler(CommandHandler("assign", assign_shift))
     app.add_handler(CommandHandler("remove", remove_shift))
     app.add_handler(CommandHandler("skip", skip_shift))
@@ -926,7 +995,7 @@ def main():
     app.job_queue.run_repeating(send_morning_notifications, interval=60, first=10)
     app.job_queue.run_repeating(send_evening_notifications, interval=60, first=10)
     
-    print("🤖 Shift Bot (полная версия) запущен!")
+    print("🤖 Veda (полная версия) запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
