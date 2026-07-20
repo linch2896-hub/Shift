@@ -411,8 +411,8 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     active_operators = list(operators_db.keys())
-    if len(active_operators) < 2:
-        await update.message.reply_text("Нужно минимум 2 оператора!")
+    if len(active_operators) < 4:
+        await update.message.reply_text("Нужно минимум 4 оператора для графика 2/2!")
         return
     
     today = datetime.now().date()
@@ -421,33 +421,21 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notifications = []
     manually_assigned_count = 0
     
+    # Определяем пары операторов (сортируем по имени для стабильности)
+    sorted_operators = sorted(active_operators, key=lambda uid: operators_db[uid]['name'])
+    pair1 = [sorted_operators[0], sorted_operators[1]]
+    pair2 = [sorted_operators[2], sorted_operators[3]]
+    
+    # Определяем, какая пара должна работать сегодня
+    # Считаем дни от начала эпохи (для стабильного чередования)
+    days_since_epoch = (today - datetime(2020, 1, 1).date()).days
+    current_pair_index = (days_since_epoch // 2) % 2  # 0 или 1
+    
     for i in range(7):
         day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
         day_obj = today + timedelta(days=i)
-        yesterday = (today + timedelta(days=i-1)).strftime('%Y-%m-%d')
-        day_before = (today + timedelta(days=i-2)).strftime('%Y-%m-%d')
         
         existing_shifts = schedule_db.get(day, [])
-        existing_user_ids = {s['user_id'] for s in existing_shifts}
-        
-        # ПРАВИЛО 2/2: исключаем только тех, кто работал вчера И позавчера
-        worked_consecutive = set()
-        for uid in active_operators:
-            worked_yesterday = False
-            worked_day_before = False
-            
-            if yesterday in schedule_db:
-                worked_yesterday = any(s['user_id'] == uid for s in schedule_db[yesterday])
-            if day_before in schedule_db:
-                worked_day_before = any(s['user_id'] == uid for s in schedule_db[day_before])
-            
-            # Исключаем только если работал оба дня подряд
-            if worked_yesterday and worked_day_before:
-                worked_consecutive.add(uid)
-            
-            # Также исключаем тех, кто в skip на этот день
-            if day in skip_db and skip_db[day].get('user_id') == uid:
-                worked_consecutive.add(uid)
         
         # Если уже есть 2 оператора — пропускаем день
         if len(existing_shifts) >= 2:
@@ -457,25 +445,29 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
             for shift in existing_shifts:
                 name = operators_db.get(shift['user_id'], {}).get('name', 'Неизвестно')
-                msg += f"  👤 {name} (вручную)\n"
-                group_msg += f"   {name}\n"
+                msg += f"   {name} (вручную)\n"
+                group_msg += f"  👤 {name}\n"
             msg += "\n"
             group_msg += "\n"
+            
+            # Определяем, какая пара работала, чтобы продолжить чередование
+            shift_user_ids = {s['user_id'] for s in existing_shifts}
+            if all(uid in pair1 for uid in shift_user_ids):
+                current_pair_index = 0  # Работала пара 1
+            elif all(uid in pair2 for uid in shift_user_ids):
+                current_pair_index = 1  # Работала пара 2
+            
+            # Переключаем пару каждые 2 дня
+            if i % 2 == 1:  # Каждый второй день меняем пару
+                current_pair_index = 1 - current_pair_index
+            
             continue
         
-        # Доступные операторы (не работали 2 дня подряд)
-        available = [uid for uid in active_operators if uid not in worked_consecutive]
-        if len(available) < 2:
-            available = active_operators[:]  # Если не хватает, берём всех
+        # Выбираем пару для этого дня
+        chosen_pair = pair1 if current_pair_index == 0 else pair2
         
-        # Сортируем по количеству смен (кто меньше работал, тот первым)
-        available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
-        
-        # Дополняем до 2 операторов
-        needed = 2 - len(existing_shifts)
-        chosen_ids = available[:needed]
-        
-        for uid in chosen_ids:
+        # Добавляем операторов из выбранной пары
+        for uid in chosen_pair:
             operators_db[uid]['shifts_count'] += 1
             existing_shifts.append({"user_id": uid, "name": operators_db[uid]['name']})
         
@@ -501,10 +493,9 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += "\n"
         group_msg += "\n"
         
-        if len(existing_shifts) < 2:
-            try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=f"️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!")
-            except: pass
+        # Переключаем пару каждые 2 дня
+        if i % 2 == 1:
+            current_pair_index = 1 - current_pair_index
     
     save_data()
     
@@ -536,37 +527,28 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     active_operators = list(operators_db.keys())
-    if len(active_operators) < 2:
-        await update.message.reply_text("Нужно минимум 2 оператора!")
+    if len(active_operators) < 4:
+        await update.message.reply_text("Нужно минимум 4 оператора для графика 2/2!")
         return
     
     today = datetime.now().date()
-    msg = "🗓️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
-    group_msg = " <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
+    msg = "️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
+    group_msg = "📋 <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
     manually_assigned_count = 0
+    
+    # Определяем пары
+    sorted_operators = sorted(active_operators, key=lambda uid: operators_db[uid]['name'])
+    pair1 = [sorted_operators[0], sorted_operators[1]]
+    pair2 = [sorted_operators[2], sorted_operators[3]]
+    
+    days_since_epoch = (today - datetime(2020, 1, 1).date()).days
+    current_pair_index = (days_since_epoch // 2) % 2
     
     for i in range(30):
         day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
         day_obj = today + timedelta(days=i)
-        yesterday = (today + timedelta(days=i-1)).strftime('%Y-%m-%d')
-        day_before = (today + timedelta(days=i-2)).strftime('%Y-%m-%d')
         
         existing_shifts = schedule_db.get(day, [])
-        existing_user_ids = {s['user_id'] for s in existing_shifts}
-        
-        # ПРАВИЛО 2/2: исключаем только тех, кто работал вчера И позавчера
-        worked_consecutive = set()
-        for uid in active_operators:
-            worked_yesterday = False
-            worked_day_before = False
-            
-            if yesterday in schedule_db:
-                worked_yesterday = any(s['user_id'] == uid for s in schedule_db[yesterday])
-            if day_before in schedule_db:
-                worked_day_before = any(s['user_id'] == uid for s in schedule_db[day_before])
-            
-            if worked_yesterday and worked_day_before:
-                worked_consecutive.add(uid)
         
         if len(existing_shifts) >= 2:
             manually_assigned_count += 1
@@ -576,21 +558,24 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for shift in existing_shifts:
                 name = operators_db.get(shift['user_id'], {}).get('name', 'Неизвестно')
                 msg += f"  👤 {name} (вручную)\n"
-                group_msg += f"  👤 {name}\n"
+                group_msg += f"   {name}\n"
             msg += "\n"
             group_msg += "\n"
+            
+            shift_user_ids = {s['user_id'] for s in existing_shifts}
+            if all(uid in pair1 for uid in shift_user_ids):
+                current_pair_index = 0
+            elif all(uid in pair2 for uid in shift_user_ids):
+                current_pair_index = 1
+            
+            if i % 2 == 1:
+                current_pair_index = 1 - current_pair_index
+            
             continue
         
-        available = [uid for uid in active_operators if uid not in worked_consecutive]
-        if len(available) < 2:
-            available = active_operators[:]
+        chosen_pair = pair1 if current_pair_index == 0 else pair2
         
-        available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
-        
-        needed = 2 - len(existing_shifts)
-        chosen_ids = available[:needed]
-        
-        for uid in chosen_ids:
+        for uid in chosen_pair:
             operators_db[uid]['shifts_count'] += 1
             existing_shifts.append({"user_id": uid, "name": operators_db[uid]['name']})
         
@@ -603,10 +588,13 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for shift in existing_shifts:
             name = shift['name']
             msg += f"  👤 {name}\n"
-            group_msg += f"   {name}\n"
+            group_msg += f"  👤 {name}\n"
         
         msg += "\n"
         group_msg += "\n"
+        
+        if i % 2 == 1:
+            current_pair_index = 1 - current_pair_index
     
     save_data()
     
