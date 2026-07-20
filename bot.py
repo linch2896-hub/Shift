@@ -280,7 +280,7 @@ async def next_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         when = f"через {days_left} дня"
                     
-                    msg = f"📅 {name}, твоя следующая смена: <b>{date_obj.strftime('%d.%m')} ({day_ru})</b> — {when}\n 09:00 - 20:00"
+                    msg = f"📅 {name}, твоя следующая смена: <b>{date_obj.strftime('%d.%m')} ({day_ru})</b> — {when}\n⏰ 09:00 - 20:00"
                     await update.message.reply_text(msg, parse_mode='HTML')
                     return
     
@@ -303,7 +303,7 @@ async def schedule_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 skip_name = operators_db.get(skip_db[day]['user_id'], {}).get('name', 'Неизвестно')
                 skip_info = f" ⚠️ {skip_name} не выйдет ({skip_db[day]['reason']})"
             
-            msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>{skip_info}\n"
+            msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>{skip_info}\n"
             for shift in schedule_db[day]:
                 if day in skip_db and skip_db[day].get('user_id') == shift['user_id']:
                     msg += f"  ❌ <s>{shift['name']}</s> (пропуск)\n"
@@ -414,8 +414,9 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today = datetime.now().date()
     msg = "🗓️ <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
-    group_msg = " <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
+    group_msg = "📋 <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
     notifications = []
+    manually_assigned_count = 0
     
     for i in range(7):
         day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
@@ -423,7 +424,12 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         yesterday = (today + timedelta(days=i-1)).strftime('%Y-%m-%d')
         day_before = (today + timedelta(days=i-2)).strftime('%Y-%m-%d')
         
-        worked_recently = set()
+        # Проверяем, есть ли уже назначенные операторы на этот день
+        existing_shifts = schedule_db.get(day, [])
+        existing_user_ids = {s['user_id'] for s in existing_shifts}
+        
+        # Считаем тех, кто работал недавно (включая уже назначенных)
+        worked_recently = set(existing_user_ids)
         if yesterday in schedule_db:
             for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
         if day_before in schedule_db:
@@ -431,41 +437,69 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if day in skip_db:
             worked_recently.add(skip_db[day]['user_id'])
         
+        # Если уже есть 2 оператора — пропускаем день
+        if len(existing_shifts) >= 2:
+            manually_assigned_count += 1
+            day_ru = get_ru_day(day_obj)
+            msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b> ✅ (уже назначено)\n"
+            group_msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+            for shift in existing_shifts:
+                name = operators_db.get(shift['user_id'], {}).get('name', 'Неизвестно')
+                msg += f"  👤 {name} (вручную)\n"
+                group_msg += f"  👤 {name}\n"
+            msg += "\n"
+            group_msg += "\n"
+            continue
+        
+        # Ищем свободных операторов
         available = [uid for uid in active_operators if uid not in worked_recently]
         if len(available) < 2:
             available = active_operators[:]
         
         available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
-        chosen_ids = available[:2]
-        schedule_db[day] = []
+        
+        # Дополняем до 2 операторов
+        needed = 2 - len(existing_shifts)
+        chosen_ids = available[:needed]
+        
+        # Добавляем новых операторов к существующим
+        for uid in chosen_ids:
+            operators_db[uid]['shifts_count'] += 1
+            existing_shifts.append({"user_id": uid, "name": operators_db[uid]['name']})
+        
+        schedule_db[day] = existing_shifts
         
         day_ru = get_ru_day(day_obj)
         msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         
-        for uid in chosen_ids:
-            operators_db[uid]['shifts_count'] += 1
-            schedule_db[day].append({"user_id": uid, "name": operators_db[uid]['name']})
-            name = operators_db[uid]['name']
-            
-            msg += f"  👤 {name}\n"
+        for shift in existing_shifts:
+            uid = shift['user_id']
+            name = shift['name']
+            msg += f"   {name}\n"
             group_msg += f"  👤 {name}\n"
             
+            # Собираем уведомления для операторов
             existing = [n for n in notifications if n['uid'] == uid]
             if not existing:
                 notifications.append({'uid': uid, 'days': []})
             for n in notifications:
                 if n['uid'] == uid:
                     n['days'].append(f"{day_obj.strftime('%d.%m')} ({day_ru})")
+        
         msg += "\n"
         group_msg += "\n"
         
-        if len(chosen_ids) < 2:
+        if len(existing_shifts) < 2:
             try:
                 await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!")
             except: pass
     
     save_data()
+    
+    # Добавляем информацию о вручную назначенных сменах
+    if manually_assigned_count > 0:
+        msg = f"ℹ️ Учтено {manually_assigned_count} дней с ручными назначениями.\n\n" + msg
     
     # 1. Отправляем подробный график АДМИНИСТРАТОРУ
     await update.message.reply_text(msg, parse_mode='HTML')
@@ -501,7 +535,8 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today = datetime.now().date()
     msg = "🗓️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
-    group_msg = "🗓️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
+    group_msg = "️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
+    manually_assigned_count = 0
     
     for i in range(30):
         day = (today + timedelta(days=i)).strftime('%Y-%m-%d')
@@ -509,34 +544,63 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         yesterday = (today + timedelta(days=i-1)).strftime('%Y-%m-%d')
         day_before = (today + timedelta(days=i-2)).strftime('%Y-%m-%d')
         
-        worked_recently = set()
+        # Проверяем, есть ли уже назначенные операторы
+        existing_shifts = schedule_db.get(day, [])
+        existing_user_ids = {s['user_id'] for s in existing_shifts}
+        
+        worked_recently = set(existing_user_ids)
         if yesterday in schedule_db:
             for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
         if day_before in schedule_db:
             for s in schedule_db[day_before]: worked_recently.add(s['user_id'])
         
+        # Если уже есть 2 оператора — пропускаем
+        if len(existing_shifts) >= 2:
+            manually_assigned_count += 1
+            day_ru = get_ru_day(day_obj)
+            msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b> ✅ (уже назначено)\n"
+            group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+            for shift in existing_shifts:
+                name = operators_db.get(shift['user_id'], {}).get('name', 'Неизвестно')
+                msg += f"  👤 {name} (вручную)\n"
+                group_msg += f"  👤 {name}\n"
+            msg += "\n"
+            group_msg += "\n"
+            continue
+        
+        # Ищем свободных операторов
         available = [uid for uid in active_operators if uid not in worked_recently]
         if len(available) < 2:
             available = active_operators[:]
         
         available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
-        chosen_ids = available[:2]
-        schedule_db[day] = []
+        
+        # Дополняем до 2 операторов
+        needed = 2 - len(existing_shifts)
+        chosen_ids = available[:needed]
+        
+        for uid in chosen_ids:
+            operators_db[uid]['shifts_count'] += 1
+            existing_shifts.append({"user_id": uid, "name": operators_db[uid]['name']})
+        
+        schedule_db[day] = existing_shifts
         
         day_ru = get_ru_day(day_obj)
         msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         
-        for uid in chosen_ids:
-            operators_db[uid]['shifts_count'] += 1
-            schedule_db[day].append({"user_id": uid, "name": operators_db[uid]['name']})
-            name = operators_db[uid]['name']
+        for shift in existing_shifts:
+            name = shift['name']
             msg += f"  👤 {name}\n"
             group_msg += f"  👤 {name}\n"
+        
         msg += "\n"
         group_msg += "\n"
     
     save_data()
+    
+    if manually_assigned_count > 0:
+        msg = f"ℹ️ Учтено {manually_assigned_count} дней с ручными назначениями.\n\n" + msg
     
     # 1. Администратору
     await update.message.reply_text(msg, parse_mode='HTML')
@@ -551,7 +615,7 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= РУЧНОЕ УПРАВЛЕНИЕ СМЕНАМИ =================
 async def assign_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Только для администратора! ❌")
+        await update.message.reply_text("Только для администратора! ")
         return
     
     if len(context.args) < 2:
@@ -663,27 +727,27 @@ async def skip_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     name = operators_db[user_id]['name']
-    msg = f"️ {name}, ваша смена {date_str} отмечена как пропуск.\nПричина: {reason}\n"
+    msg = f"⚠️ {name}, ваша смена {date_str} отмечена как пропуск.\nПричина: {reason}\n"
     
     if replacement_id:
         repl_name = operators_db[replacement_id]['name']
         schedule_db[date_formatted].append({"user_id": replacement_id, "name": repl_name})
         operators_db[replacement_id]['shifts_count'] += 1
-        msg += f"🔄 Автоматически назначена замена: {repl_name}"
+        msg += f" Автоматически назначена замена: {repl_name}"
         
         repl_chat_id = operators_db[replacement_id].get('chat_id')
         if repl_chat_id:
             await safe_send(
                 context.bot,
                 repl_chat_id,
-                f"🔄 {repl_name}, вам назначена замена! Смена {date_str} (09:00-20:00). Причина: {reason}"
+                f" {repl_name}, вам назначена замена! Смена {date_str} (09:00-20:00). Причина: {reason}"
             )
     else:
-        msg += "❗ Не удалось найти замену. Администратор уведомлён."
+        msg += " Не удалось найти замену. Администратор уведомлён."
         await safe_send(
             context.bot,
             ADMIN_ID,
-            f"⚠️ {name} пропускает смену {date_str} (причина: {reason}). Замена не найдена!"
+            f"️ {name} пропускает смену {date_str} (причина: {reason}). Замена не найдена!"
         )
     
     save_data()
@@ -742,7 +806,7 @@ async def swap_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("✅ Согласен", callback_data=f"swap_accept_{request_id}"),
-         InlineKeyboardButton(" Отказ", callback_data=f"swap_decline_{request_id}")]
+         InlineKeyboardButton("❌ Отказ", callback_data=f"swap_decline_{request_id}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -750,7 +814,7 @@ async def swap_shift(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send(
             context.bot,
             target_chat_id,
-            f" {requester_name} хочет поменяться с вами сменой {date_str}. Согласны?",
+            f"🔄 {requester_name} хочет поменяться с вами сменой {date_str}. Согласны?",
         )
         try:
             await context.bot.send_message(
@@ -895,7 +959,7 @@ async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Только для администратора! ❌")
+        await update.message.reply_text("Только для администратора! ")
         return
     
     schedule_db.clear()
@@ -904,7 +968,7 @@ async def clear_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for uid in operators_db:
         operators_db[uid]['shifts_count'] = 0
     save_data()
-    await update.message.reply_text("🗑️ График очищен!")
+    await update.message.reply_text("️ График очищен!")
 
 # ================= УВЕДОМЛЕНИЯ =================
 async def send_morning_notifications(context: ContextTypes.DEFAULT_TYPE):
@@ -959,7 +1023,7 @@ async def send_evening_notifications(context: ContextTypes.DEFAULT_TYPE):
             await safe_send(
                 context.bot,
                 chat_id,
-                f" {name}, завтра у тебя смена с 09:00 до 20:00. Подготовься и выспись! 😊"
+                f"🌙 {name}, завтра у тебя смена с 09:00 до 20:00. Подготовься и выспись! 😊"
             )
 
 # ================= ЗАПУСК =================
