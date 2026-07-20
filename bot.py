@@ -416,7 +416,7 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     today = datetime.now().date()
-    msg = "️ <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
+    msg = "🗓️ <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
     group_msg = "📋 <b>График смен на неделю (09:00 - 20:00):</b>\n\n"
     notifications = []
     manually_assigned_count = 0
@@ -430,33 +430,48 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         existing_shifts = schedule_db.get(day, [])
         existing_user_ids = {s['user_id'] for s in existing_shifts}
         
-        worked_recently = set(existing_user_ids)
-        if yesterday in schedule_db:
-            for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
-        if day_before in schedule_db:
-            for s in schedule_db[day_before]: worked_recently.add(s['user_id'])
-        if day in skip_db:
-            worked_recently.add(skip_db[day]['user_id'])
+        # ПРАВИЛО 2/2: исключаем только тех, кто работал вчера И позавчера
+        worked_consecutive = set()
+        for uid in active_operators:
+            worked_yesterday = False
+            worked_day_before = False
+            
+            if yesterday in schedule_db:
+                worked_yesterday = any(s['user_id'] == uid for s in schedule_db[yesterday])
+            if day_before in schedule_db:
+                worked_day_before = any(s['user_id'] == uid for s in schedule_db[day_before])
+            
+            # Исключаем только если работал оба дня подряд
+            if worked_yesterday and worked_day_before:
+                worked_consecutive.add(uid)
+            
+            # Также исключаем тех, кто в skip на этот день
+            if day in skip_db and skip_db[day].get('user_id') == uid:
+                worked_consecutive.add(uid)
         
+        # Если уже есть 2 оператора — пропускаем день
         if len(existing_shifts) >= 2:
             manually_assigned_count += 1
             day_ru = get_ru_day(day_obj)
-            msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b> ✅ (уже назначено)\n"
-            group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+            msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b> ✅ (уже назначено)\n"
+            group_msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
             for shift in existing_shifts:
                 name = operators_db.get(shift['user_id'], {}).get('name', 'Неизвестно')
                 msg += f"  👤 {name} (вручную)\n"
-                group_msg += f"  👤 {name}\n"
+                group_msg += f"   {name}\n"
             msg += "\n"
             group_msg += "\n"
             continue
         
-        available = [uid for uid in active_operators if uid not in worked_recently]
+        # Доступные операторы (не работали 2 дня подряд)
+        available = [uid for uid in active_operators if uid not in worked_consecutive]
         if len(available) < 2:
-            available = active_operators[:]
+            available = active_operators[:]  # Если не хватает, берём всех
         
+        # Сортируем по количеству смен (кто меньше работал, тот первым)
         available.sort(key=lambda uid: operators_db[uid]['shifts_count'])
         
+        # Дополняем до 2 операторов
         needed = 2 - len(existing_shifts)
         chosen_ids = available[:needed]
         
@@ -467,7 +482,7 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_db[day] = existing_shifts
         
         day_ru = get_ru_day(day_obj)
-        msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         
         for shift in existing_shifts:
@@ -488,7 +503,7 @@ async def generate_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if len(existing_shifts) < 2:
             try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!")
+                await context.bot.send_message(chat_id=ADMIN_ID, text=f"️ На {day_obj.strftime('%d.%m')} не удалось назначить 2 операторов!")
             except: pass
     
     save_data()
@@ -527,7 +542,7 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     today = datetime.now().date()
     msg = "🗓️ <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
-    group_msg = "📋 <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
+    group_msg = " <b>График смен на месяц (09:00 - 20:00):</b>\n\n"
     manually_assigned_count = 0
     
     for i in range(30):
@@ -539,11 +554,19 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         existing_shifts = schedule_db.get(day, [])
         existing_user_ids = {s['user_id'] for s in existing_shifts}
         
-        worked_recently = set(existing_user_ids)
-        if yesterday in schedule_db:
-            for s in schedule_db[yesterday]: worked_recently.add(s['user_id'])
-        if day_before in schedule_db:
-            for s in schedule_db[day_before]: worked_recently.add(s['user_id'])
+        # ПРАВИЛО 2/2: исключаем только тех, кто работал вчера И позавчера
+        worked_consecutive = set()
+        for uid in active_operators:
+            worked_yesterday = False
+            worked_day_before = False
+            
+            if yesterday in schedule_db:
+                worked_yesterday = any(s['user_id'] == uid for s in schedule_db[yesterday])
+            if day_before in schedule_db:
+                worked_day_before = any(s['user_id'] == uid for s in schedule_db[day_before])
+            
+            if worked_yesterday and worked_day_before:
+                worked_consecutive.add(uid)
         
         if len(existing_shifts) >= 2:
             manually_assigned_count += 1
@@ -558,7 +581,7 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
             group_msg += "\n"
             continue
         
-        available = [uid for uid in active_operators if uid not in worked_recently]
+        available = [uid for uid in active_operators if uid not in worked_consecutive]
         if len(available) < 2:
             available = active_operators[:]
         
@@ -574,13 +597,13 @@ async def generate_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_db[day] = existing_shifts
         
         day_ru = get_ru_day(day_obj)
-        msg += f" <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
+        msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         group_msg += f"📅 <b>{day_obj.strftime('%d.%m')} ({day_ru})</b>\n"
         
         for shift in existing_shifts:
             name = shift['name']
             msg += f"  👤 {name}\n"
-            group_msg += f"  👤 {name}\n"
+            group_msg += f"   {name}\n"
         
         msg += "\n"
         group_msg += "\n"
