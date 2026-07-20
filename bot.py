@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get('TOKEN', '8982534262:AAGRHPxIN50Q5PSbTkfrymYG9PjktECzgB8')
-ADMIN_ID = 914930076  # <-- ВСТАВЬТЕ СЮДА ВАШ ID ИЗ @userinfobot
+ADMIN_ID = 914930076 # <-- ВСТАВЬТЕ СЮДА ВАШ ID ИЗ @userinfobot
 DATA_FILE = "shift_data.json"
 
 # ================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =================
