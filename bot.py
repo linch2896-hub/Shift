@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ================= НАСТРОЙКИ =================
 TOKEN = os.environ.get('TOKEN', '8982534262:AAGRHPxIN50Q5PSbTkfrymYG9PjktECzgB8')
-ADMIN_ID = 914930076 # <-- ВСТАВЬТЕ СЮДА ВАШ ID ИЗ @userinfobot
+ADMIN_ID = 914930076  # <-- ВСТАВЬТЕ СЮДА ВАШ ID ИЗ @userinfobot
 DATA_FILE = "shift_data.json"
 
 # ================= ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =================
@@ -893,4 +893,252 @@ async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-   
+    if user_id not in operators_db:
+        await update.message.reply_text("Сначала зарегистрируйтесь: /register")
+        return
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now().strftime('%H:%M')
+    
+    if today not in attendance_db or user_id not in attendance_db[today]:
+        await update.message.reply_text("Вы не отмечались сегодня на смене!")
+        return
+    
+    attendance_db[today][user_id]['checkout'] = now
+    save_data()
+    
+    name = operators_db[user_id]['name']
+    await update.message.reply_text(f"✅ {name}, вы отметились об уходе в {now}. Хорошего отдыха! 🌙")
+
+async def attendance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Использование: /attendance ДД.ММ")
+        return
+    
+    date_str = context.args[0]
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        await update.message.reply_text("Неверный формат даты.")
+        return
+    
+    if date_formatted not in attendance_db:
+        await update.message.reply_text(f"На {date_str} нет данных о посещаемости.")
+        return
+    
+    date_obj = datetime.strptime(date_formatted, '%Y-%m-%d')
+    day_ru = get_ru_day(date_obj)
+    msg = f"📋 <b>Посещаемость {date_obj.strftime('%d.%m')} ({day_ru}):</b>\n\n"
+    
+    for uid, record in attendance_db[date_formatted].items():
+        if uid in operators_db:
+            name = operators_db[uid]['name']
+            checkin = record.get('checkin', '—')
+            checkout = record.get('checkout', '—')
+            msg += f"👤 {name}: вход {checkin}, выход {checkout}\n"
+    
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+async def clear_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Только для администратора! ❌")
+        return
+    
+    schedule_db.clear()
+    skip_db.clear()
+    attendance_db.clear()
+    for uid in operators_db:
+        operators_db[uid]['shifts_count'] = 0
+    save_data()
+    await update.message.reply_text("🗑️ График очищен!")
+
+# ================= БЫСТРОЕ НАЗНАЧЕНИЕ БЕЗ КОМАНД =================
+async def handle_text_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка простых текстовых назначений без команд.
+    Форматы:
+      - Анна 15.07
+      - 15.07 Анна Иван
+      - Анна, Иван 15.07
+    """
+    if not is_admin(update.effective_user.id):
+        return
+    
+    text = update.message.text.strip()
+    if not text:
+        return
+    
+    # Ищем дату в формате ДД.ММ
+    date_pattern = r'(\d{1,2}\.\d{1,2})'
+    date_match = re.search(date_pattern, text)
+    
+    if not date_match:
+        return  # Не похоже на назначение смены
+    
+    date_str = date_match.group(1)
+    date_formatted = parse_date(date_str)
+    
+    if not date_formatted:
+        return
+    
+    # Извлекаем имена (всё, что не дата и не запятые/точки)
+    names_text = text.replace(date_str, '').strip()
+    names_text = names_text.replace(',', ' ').replace(';', ' ')
+    names = [n.strip() for n in names_text.split() if n.strip()]
+    
+    if not names:
+        return
+    
+    # Ищем операторов по именам
+    assigned = []
+    already_assigned = []
+    not_found = []
+    
+    for name in names:
+        found_uid = None
+        found_name = None
+        # Ищем по точному совпадению имени (регистронезависимо)
+        for uid, data in operators_db.items():
+            if data['name'].lower() == name.lower():
+                found_uid = uid
+                found_name = data['name']
+                break
+        
+        if found_uid:
+            if date_formatted not in schedule_db:
+                schedule_db[date_formatted] = []
+            
+            # Проверяем, не назначен ли уже
+            if any(s['user_id'] == found_uid for s in schedule_db[date_formatted]):
+                already_assigned.append(found_name)
+            else:
+                schedule_db[date_formatted].append({"user_id": found_uid, "name": found_name})
+                operators_db[found_uid]['shifts_count'] += 1
+                assigned.append(found_name)
+        else:
+            not_found.append(name)
+    
+    if assigned or already_assigned or not_found:
+        save_data()
+        date_obj = datetime.strptime(date_formatted, '%Y-%m-%d')
+        day_ru = get_ru_day(date_obj)
+        
+        msg = f"📅 <b>{date_obj.strftime('%d.%m')} ({day_ru})</b>\n\n"
+        
+        if assigned:
+            msg += f"✅ Назначены:\n"
+            for name in assigned:
+                msg += f"  👤 {name}\n"
+        
+        if already_assigned:
+            msg += f"\n⚠️ Уже были в графике:\n"
+            for name in already_assigned:
+                msg += f"  👤 {name}\n"
+        
+        if not_found:
+            msg += f"\n❌ Не найдены (проверьте имя):\n"
+            for name in not_found:
+                msg += f"  • {name}\n"
+        
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+# ================= УВЕДОМЛЕНИЯ =================
+async def send_morning_notifications(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().strftime('%Y-%m-%d')
+    current_time = datetime.now()
+    
+    if current_time.hour != 8 or current_time.minute > 2:
+        return
+    
+    if today not in schedule_db:
+        return
+    
+    for shift in schedule_db[today]:
+        user_id = shift['user_id']
+        if user_id not in operators_db:
+            continue
+        if today in skip_db and skip_db[today].get('user_id') == user_id:
+            continue
+        
+        chat_id = operators_db[user_id].get('chat_id')
+        name = operators_db[user_id]['name']
+        
+        if chat_id:
+            await safe_send(
+                context.bot,
+                chat_id,
+                f"☀️ Доброе утро, {name}! Сегодня твоя смена с 09:00 до 20:00. Не забудь! 💪"
+            )
+
+async def send_evening_notifications(context: ContextTypes.DEFAULT_TYPE):
+    today = datetime.now().strftime('%Y-%m-%d')
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+    current_time = datetime.now()
+    
+    if current_time.hour != 18 or current_time.minute > 2:
+        return
+    
+    if tomorrow not in schedule_db:
+        return
+    
+    for shift in schedule_db[tomorrow]:
+        user_id = shift['user_id']
+        if user_id not in operators_db:
+            continue
+        if tomorrow in skip_db and skip_db[tomorrow].get('user_id') == user_id:
+            continue
+        
+        chat_id = operators_db[user_id].get('chat_id')
+        name = operators_db[user_id]['name']
+        
+        if chat_id:
+            await safe_send(
+                context.bot,
+                chat_id,
+                f"🌙 {name}, завтра у тебя смена с 09:00 до 20:00. Подготовься и выспись! 😊"
+            )
+
+# ================= ЗАПУСК =================
+def main():
+    load_data()
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("register", register_operator))
+    app.add_handler(CommandHandler("add_operator", add_operator))
+    app.add_handler(CommandHandler("remove_operator", remove_operator))
+    app.add_handler(CommandHandler("my_shifts", my_shifts))
+    app.add_handler(CommandHandler("next", next_shift))
+    app.add_handler(CommandHandler("schedule", schedule_week))
+    app.add_handler(CommandHandler("operators", list_operators))
+    app.add_handler(CommandHandler("operator_stats", operator_stats))
+    app.add_handler(CommandHandler("monthly_stats", monthly_stats))
+    app.add_handler(CommandHandler("generate_week", generate_week))
+    app.add_handler(CommandHandler("generate_month", generate_month))
+    app.add_handler(CommandHandler("set_group", set_group_chat))
+    app.add_handler(CommandHandler("assign", assign_shift))
+    app.add_handler(CommandHandler("remove", remove_shift))
+    app.add_handler(CommandHandler("skip", skip_shift))
+    app.add_handler(CommandHandler("swap", swap_shift))
+    app.add_handler(CommandHandler("checkin", checkin))
+    app.add_handler(CommandHandler("checkout", checkout))
+    app.add_handler(CommandHandler("attendance", attendance))
+    app.add_handler(CommandHandler("clear_schedule", clear_schedule))
+    
+    app.add_handler(CallbackQueryHandler(handle_swap_callback))
+    
+    # Обработчик быстрых текстовых назначений (только для админа)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_assignment))
+    
+    app.job_queue.run_repeating(send_morning_notifications, interval=60, first=10)
+    app.job_queue.run_repeating(send_evening_notifications, interval=60, first=10)
+    
+    print("🤖 Veda (полная версия с быстрым назначением) запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
